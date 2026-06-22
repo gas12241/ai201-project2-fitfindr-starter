@@ -18,7 +18,44 @@ Usage (once implemented):
     print(result["error"])   # None on success
 """
 
-from tools import search_listings, suggest_outfit, create_fit_card
+import json
+import re
+
+from tools import search_listings, suggest_outfit, create_fit_card, _get_groq_client  # _get_groq_client used by _parse_query
+
+
+# ── query parser ──────────────────────────────────────────────────────────────
+
+def _parse_query(query: str) -> dict:
+    """Use the LLM to extract item description, size, and max_price from the query."""
+    prompt = (
+        f'Extract search parameters from this clothing query.\n\n'
+        f'Query: "{query}"\n\n'
+        'Return a JSON object with exactly these fields:\n'
+        '- "description": only the clothing item the user wants to buy — ignore styling context like "works with X" or "pairs with Y"\n'
+        '- "size": the size if mentioned (e.g. "M", "S", "XL"), or null\n'
+        '- "max_price": the maximum price as a number if mentioned, or null\n\n'
+        'Example: {"description": "lightweight black jacket", "size": null, "max_price": 75.0}\n\n'
+        'Return only the JSON object, no other text.'
+    )
+    try:
+        client = _get_groq_client()
+        response = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+        )
+        return json.loads(response.choices[0].message.content.strip())
+    except Exception:
+        # Fall back to regex if LLM parse fails
+        price_match = re.search(r'(?:under|less than|max|below|<)\s*\$?\s*(\d+(?:\.\d+)?)', query, re.IGNORECASE)
+        size_match = re.search(r"\bsize\s+([a-z0-9/]+)\b|(?<!')\b(xs|xl|xxl|2xl|3xl|one size|[sml])\b(?!')", query, re.IGNORECASE)
+        description = re.sub(r'(?:under|less than|max|below|<)\s*\$?\s*\d+(?:\.\d+)?', '', query, flags=re.IGNORECASE).strip(' ,.')
+        return {
+            "description": description,
+            "size": (size_match.group(1) or size_match.group(2)).upper() if size_match else None,
+            "max_price": float(price_match.group(1)) if price_match else None,
+        }
 
 
 # ── session state ─────────────────────────────────────────────────────────────
@@ -92,9 +129,43 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     Before writing code, complete the Planning Loop and State Management sections
     of planning.md — your implementation should match what you described there.
     """
-    # TODO: implement the planning loop
+    # Step 1: Initialize session
     session = _new_session(query, wardrobe)
-    session["error"] = "Planning loop not yet implemented."
+
+    # Step 2: Parse query using LLM to separate item description from styling context
+    parsed = _parse_query(query)
+    description = parsed.get("description", query)
+    size = parsed.get("size")
+    max_price = parsed.get("max_price")
+
+    session["parsed"] = {"description": description, "size": size, "max_price": max_price}
+
+    # Step 3: Search listings — stop early if no results
+    session["search_results"] = search_listings(description, size=size, max_price=max_price)
+    if not session["search_results"]:
+        session["error"] = (
+            f"No listings matched your search for \"{description}\""
+            + (f" in size {size}" if size else "")
+            + (f" under ${max_price:.0f}" if max_price else "")
+            + ". Try different keywords, a higher max price, or removing the size filter."
+        )
+        return session
+
+    # Step 4: Select top result
+    session["selected_item"] = session["search_results"][0]
+    print("[DEBUG] selected_item:", session["selected_item"])
+
+    # Step 5: Suggest outfit
+    session["outfit_suggestion"] = suggest_outfit(session["selected_item"], wardrobe)
+    print("[DEBUG] outfit_suggestion passed into create_fit_card:", session["outfit_suggestion"])
+    if not session["outfit_suggestion"]:
+        session["error"] = "Could not generate an outfit suggestion."
+        return session
+
+    # Step 6: Create fit card
+    session["fit_card"] = create_fit_card(session["outfit_suggestion"], session["selected_item"])
+
+    # Step 7: Return session
     return session
 
 

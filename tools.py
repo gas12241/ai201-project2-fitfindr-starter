@@ -13,6 +13,7 @@ Tools:
 """
 
 import os
+import re
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -32,6 +33,23 @@ def _get_groq_client():
             "GROQ_API_KEY not set. Add it to a .env file in the project root."
         )
     return Groq(api_key=api_key)
+
+
+# ── stop words ────────────────────────────────────────────────────────────────
+
+_STOP_WORDS = {
+    "a", "an", "the", "i", "me", "my", "we", "our", "you", "your",
+    "it", "its", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "will", "would",
+    "could", "should", "may", "might", "shall", "can",
+    "and", "or", "but", "if", "in", "on", "at", "to", "for",
+    "of", "with", "by", "from", "up", "about", "into", "through",
+    "that", "this", "these", "those", "what", "which", "who", "how",
+    "when", "where", "why", "all", "any", "both", "each", "more",
+    "other", "some", "so", "than", "too", "very", "just", "there",
+    "want", "like", "please", "works", "available", "looking",
+    "s", "d", "t", "m",
+}
 
 
 # ── Tool 1: search_listings ───────────────────────────────────────────────────
@@ -69,8 +87,34 @@ def search_listings(
 
     Before writing code, fill in the Tool 1 section of planning.md.
     """
-    # Replace this with your implementation
-    return []
+    listings = load_listings()
+
+    if max_price is not None:
+        listings = [l for l in listings if l["price"] <= max_price]
+    if size is not None:
+        listings = [l for l in listings if size.lower() in l["size"].lower()]
+
+    keywords = set(re.findall(r'\b\w+\b', description.lower())) - _STOP_WORDS
+
+    def score(listing):
+        title_words = set(re.findall(r'\b\w+\b', listing.get("title", "").lower()))
+        other_text = " ".join([
+            listing.get("description", ""),
+            listing.get("category", ""),
+            listing.get("brand", "") or "",
+            " ".join(listing.get("style_tags", [])),
+            " ".join(listing.get("colors", [])),
+        ]).lower()
+        other_words = set(re.findall(r'\b\w+\b', other_text))
+        # Title matches count double to break ties in favour of items
+        # whose name directly contains the search keywords
+        return len(keywords & title_words) * 2 + len(keywords & other_words)
+
+    scored = [(score(l), l) for l in listings]
+    scored = [(s, l) for s, l in scored if s > 0]
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    return [l for _, l in scored]
 
 
 # ── Tool 2: suggest_outfit ────────────────────────────────────────────────────
@@ -100,8 +144,51 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
 
     Before writing code, fill in the Tool 2 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    client = _get_groq_client()
+
+    item_summary = (
+        f"{new_item.get('title', 'item')} — "
+        f"{new_item.get('condition', '')} condition, "
+        f"size {new_item.get('size', 'unknown')}, "
+        f"${new_item.get('price', '?')} on {new_item.get('platform', 'a thrift platform')}. "
+        f"Colors: {', '.join(new_item.get('colors', []))}. "
+        f"Style tags: {', '.join(new_item.get('style_tags', []))}."
+    )
+
+    wardrobe_items = wardrobe.get("items", [])
+
+    if not wardrobe_items:
+        prompt = (
+            f"I'm thinking about buying this thrifted item:\n{item_summary}\n\n"
+            "My wardrobe is empty. Give me general styling advice — what kinds of pieces pair well with it, "
+            "what vibe it suits, and 1-2 outfit ideas. Keep it to 2-3 sentences."
+        )
+    else:
+        wardrobe_lines = "\n".join(
+            f"- {item.get('name', 'item')} ({', '.join(item.get('colors', []))})"
+            for item in wardrobe_items
+        )
+        prompt = (
+            f"I'm thinking about buying this thrifted item:\n{item_summary}\n\n"
+            f"Here are pieces I already own:\n{wardrobe_lines}\n\n"
+            "Suggest 1-2 specific outfit combinations using the new item and named pieces from my wardrobe. "
+            "Be specific about which pieces to pair together. Keep it to 2-3 sentences."
+        )
+
+    try:
+        response = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"Warning: suggest_outfit LLM call failed: {e}")
+        colors = ", ".join(new_item.get("colors", []))
+        tags = ", ".join(new_item.get("style_tags", []))
+        return (
+            f"This {new_item.get('title', 'item')} in {colors} has a {tags} vibe. "
+            "It pairs well with neutral basics and versatile footwear."
+        )
 
 
 # ── Tool 3: create_fit_card ───────────────────────────────────────────────────
@@ -133,5 +220,44 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
 
     Before writing code, fill in the Tool 3 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    if not new_item:
+        return "Couldn't generate a fit card — item data was incomplete."
+
+    title = new_item.get("title", "this thrifted find")
+    price = new_item.get("price", "?")
+    platform = new_item.get("platform", "a thrift platform")
+    tags = ", ".join(new_item.get("style_tags", []))
+    colors = ", ".join(new_item.get("colors", []))
+
+    client = _get_groq_client()
+
+    if not outfit or not outfit.strip():
+        print("Warning: create_fit_card received empty outfit string, generating caption from item data only.")
+        prompt = (
+            f"Write a 2-4 sentence Instagram/TikTok caption for this thrifted item: "
+            f"{title}, ${price} on {platform}. Colors: {colors}. Style: {tags}. "
+            "Make it feel casual and authentic like a real OOTD post. "
+            "Mention the item name, price, and platform naturally once each."
+        )
+    else:
+        prompt = (
+            f"Write a 2-4 sentence Instagram/TikTok caption for this thrifted outfit:\n\n"
+            f"Item: {title}, ${price} on {platform}\n"
+            f"Outfit: {outfit}\n\n"
+            "Guidelines:\n"
+            "- Feel casual and authentic, like a real OOTD post (not a product description)\n"
+            "- Mention the item name, price, and platform naturally — once each\n"
+            "- Capture the outfit vibe in specific terms\n"
+            "- Keep it to 2-4 sentences"
+        )
+
+    try:
+        response = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.9,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"Warning: create_fit_card LLM call failed: {e}")
+        return f"Just thrifted this {title} on {platform} for ${price} and I can't stop thinking about it. {tags.capitalize()} energy."
